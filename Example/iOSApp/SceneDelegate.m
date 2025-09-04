@@ -22,6 +22,18 @@
   // property will automatically be initialized and attached to the scene. This
   // delegate does not imply the connecting scene or session are new (see
   // `application:configurationForConnectingSceneSession` instead).
+
+  if ([scene isKindOfClass:[UIWindowScene class]]) {
+    UIWindowScene *windowScene = (UIWindowScene *)scene;
+    self.window = [[UIWindow alloc] initWithWindowScene:windowScene];
+
+    // Create and set the tab bar controller as root
+    NetworkToolsTabBarController *tabBarController =
+        [[NetworkToolsTabBarController alloc] init];
+    self.window.rootViewController = tabBarController;
+
+    [self.window makeKeyAndVisible];
+  }
 }
 
 - (void)sceneDidDisconnect:(UIScene *)scene {

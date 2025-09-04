@@ -12,13 +12,16 @@ let package = Package(
             name: "SimplePing",
             targets: ["SimplePing"]),
         .library(
+            name: "SimpleTraceroute",
+            targets: ["SimpleTraceroute"]),
+        .library(
             name: "SwiftSimplePing",
             targets: ["SwiftSimplePing"]),
     ],
     targets: [
         // Targets are the basic building blocks of a package, defining a module or a test suite.
         // Targets can depend on other targets in this package and products from dependencies.
-        
+
         .target(
             name: "SimplePing",
             dependencies: [],
@@ -26,8 +29,14 @@ let package = Package(
             publicHeadersPath: "Public"
         ),
         .target(
-            name: "SwiftSimplePing",
+            name: "SimpleTraceroute",
             dependencies: ["SimplePing"],
+            path: "SimpleTraceroute",
+            publicHeadersPath: "Public"
+        ),
+        .target(
+            name: "SwiftSimplePing",
+            dependencies: ["SimplePing", "SimpleTraceroute"],
             path: "SwiftSimplePing"
         ),
 
