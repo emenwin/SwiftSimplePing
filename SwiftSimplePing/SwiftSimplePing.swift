@@ -1,6 +1,6 @@
 /*
-    Abstract:
-    A Swift wrapper around SimplePing with convenience methods and latency statistics.
+ Abstract:
+ A Swift wrapper around SimplePing with convenience methods and latency statistics.
  */
 
 import Foundation
@@ -107,6 +107,23 @@ public class SwiftSimplePing: NSObject {
     private var latencies: [TimeInterval] = []
     private var maxLatencyHistory: Int = 100
 
+    // Single ping support
+    private var singlePingCompletion: ((PingResult) -> Void)?
+    private var singlePingTimeoutTimer: Timer?
+    private var lastSinglePingSequenceNumber: UInt16?
+
+    // Errors
+    public enum SwiftSimplePingError: Error {
+        case continuousPingRunning
+        case singlePingAlreadyInProgress
+        case timeout
+    }
+
+    // Internal error wrapper for unexpected packets
+    private struct UnexpectedICMPPacketError: Error, CustomStringConvertible {
+        let description: String
+    }
+
     // MARK: - Initialization
 
     /// Initialize with hostname
@@ -134,15 +151,48 @@ public class SwiftSimplePing: NSObject {
 
     /// Send a single ping
     public func pingOnce() {
-        guard !isRunning else {
-            NSLog("SwiftSimplePing: Cannot send single ping while continuous ping is running")
+        // Backwards-compatible API: no completion or timeout (default 5s), completion only via delegate
+        pingOnce(timeout: 5.0, completion: { _ in })
+    }
+
+    /// Send a single ping with timeout and completion handler
+    /// - Parameters:
+    ///   - timeout: Timeout in seconds (default 5 seconds)
+    ///   - completion: Called with the `PingResult` (success or error/timeout)
+    public func pingOnce(timeout: TimeInterval = 5.0, completion: @escaping (PingResult) -> Void) {
+        // Cannot start a single ping while continuous mode running
+        if sendTimer != nil {  // indicates continuous mode
+            completion(
+                PingResult(
+                    sequenceNumber: 0, latency: nil,
+                    error: SwiftSimplePingError.continuousPingRunning, packetSize: 0))
+            NSLog("SwiftSimplePing: Cannot perform single ping while continuous ping is running")
             return
         }
+        // Avoid overlapping single pings
+        if singlePingCompletion != nil {
+            completion(
+                PingResult(
+                    sequenceNumber: 0, latency: nil,
+                    error: SwiftSimplePingError.singlePingAlreadyInProgress, packetSize: 0))
+            NSLog("SwiftSimplePing: Single ping already in progress")
+            return
+        }
+
+        singlePingCompletion = completion
+        pingInterval = 0  // prevent timer creation in didStart
 
         if simplePing == nil {
             startPing(continuous: false)
         } else {
             sendSinglePing()
+        }
+
+        // Setup timeout
+        if timeout > 0 {
+            singlePingTimeoutTimer = Timer.scheduledTimer(
+                timeInterval: timeout, target: self, selector: #selector(handleSinglePingTimeout),
+                userInfo: nil, repeats: false)
         }
     }
 
@@ -185,6 +235,7 @@ public class SwiftSimplePing: NSObject {
         guard let pinger = simplePing else { return }
 
         let sequenceNumber = pinger.nextSequenceNumber
+        lastSinglePingSequenceNumber = sequenceNumber
         pendingPings[sequenceNumber] = Date()
         packetsSent += 1
 
@@ -264,6 +315,72 @@ public class SwiftSimplePing: NSObject {
         return error.localizedDescription
     }
 
+    // Attempt to parse an unexpected ICMP packet and return human-readable description
+    private func parseUnexpectedPacket(_ data: Data) -> String {
+        if data.count < 20 { return "Packet too short (\(data.count) bytes)" }
+        let first = data[data.startIndex]
+        let version = (first & 0xF0) >> 4
+        if version != 4 {
+            return "Non-IPv4 unexpected packet (version=\(version)) size=\(data.count)"
+        }
+        let ihl = Int(first & 0x0F) * 4
+        guard data.count >= ihl + 8 else { return "Truncated IPv4/ICMP header" }
+        let proto = data[data.startIndex + 9]
+        guard proto == 1 else { return "Not ICMP protocol (proto=\(proto))" }
+        let icmpType = data[data.startIndex + ihl]
+        let icmpCode = data[data.startIndex + ihl + 1]
+        func typeDesc(_ t: UInt8, _ c: UInt8) -> String {
+            switch t {
+            case 0: return "Echo Reply"
+            case 3:
+                switch c {
+                case 0: return "Destination Network Unreachable"
+                case 1: return "Destination Host Unreachable"
+                case 3: return "Destination Port Unreachable"
+                case 4: return "Fragmentation Needed"
+                default: return "Destination Unreachable (code=\(c))"
+                }
+            case 4: return "Source Quench (Deprecated)"
+            case 5: return "Redirect (code=\(c))"
+            case 8: return "Echo Request"
+            case 9: return "Router Advertisement"
+            case 10: return "Router Solicitation"
+            case 11: return c == 0 ? "Time Exceeded (TTL Exceeded)" : "Time Exceeded (code=\(c))"
+            case 12: return "Parameter Problem (code=\(c))"
+            case 13: return "Timestamp Request"
+            case 14: return "Timestamp Reply"
+            default: return "ICMP type=\(t) code=\(c)"
+            }
+        }
+        var extra = ""
+        // Try to extract referenced sequence number for error packets (they embed original IP+8 bytes)
+        if [3, 4, 5, 11, 12].contains(icmpType) {
+            // Offset to original IP header inside payload
+            let originalIPOffset = ihl + 8
+            if data.count >= originalIPOffset + 20 + 8 {  // original IP header + 8 bytes (original ICMP header for echo)
+                let innerFirst = data[originalIPOffset]
+                let innerVersion = (innerFirst & 0xF0) >> 4
+                let innerIHL = Int(innerFirst & 0x0F) * 4
+                if innerVersion == 4, data.count >= originalIPOffset + innerIHL + 8 {
+                    let innerProto = data[originalIPOffset + 9]
+                    if innerProto == 1 {  // ICMP
+                        let innerICMPTypeIndex = originalIPOffset + innerIHL
+                        if data.count >= innerICMPTypeIndex + 8 {
+                            let innerType = data[innerICMPTypeIndex]
+                            if innerType == 8 || innerType == 0 {  // Echo req/rep
+                                let seqHigh = UInt16(data[innerICMPTypeIndex + 6])
+                                let seqLow = UInt16(data[innerICMPTypeIndex + 7])
+                                let seq = (seqHigh << 8) | seqLow
+                                extra = " (ref seq=\(seq))"
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        return "ICMP " + typeDesc(icmpType, icmpCode) + extra
+    }
+
     private func handlePingResponse(sequenceNumber: UInt16, packetSize: Int) {
         let now = Date()
         var latency: TimeInterval? = nil
@@ -288,6 +405,12 @@ public class SwiftSimplePing: NSObject {
 
         delegate?.swiftSimplePing(self, didReceivePingResult: result)
         updateStatistics()
+
+        // Finish single ping mode
+        if let completion = singlePingCompletion {
+            completion(result)
+            cleanupSinglePing()
+        }
     }
 
     private func handlePingError(sequenceNumber: UInt16, error: Error) {
@@ -302,6 +425,32 @@ public class SwiftSimplePing: NSObject {
 
         delegate?.swiftSimplePing(self, didReceivePingResult: result)
         updateStatistics()
+
+        if let completion = singlePingCompletion {
+            completion(result)
+            cleanupSinglePing()
+        }
+    }
+
+    private func cleanupSinglePing() {
+        singlePingTimeoutTimer?.invalidate()
+        singlePingTimeoutTimer = nil
+        singlePingCompletion = nil
+        lastSinglePingSequenceNumber = nil
+        // Stop underlying SimplePing to release resources (will trigger delegate didStop)
+        if sendTimer == nil {  // only if not in continuous mode
+            stop()
+        }
+    }
+
+    @objc private func handleSinglePingTimeout() {
+        guard let completion = singlePingCompletion else { return }
+        let seq = lastSinglePingSequenceNumber ?? 0
+        let result = PingResult(
+            sequenceNumber: seq, latency: nil, error: SwiftSimplePingError.timeout, packetSize: 0)
+        completion(result)
+        delegate?.swiftSimplePing(self, didReceivePingResult: result)
+        cleanupSinglePing()
     }
 }
 
@@ -311,7 +460,8 @@ extension SwiftSimplePing: SimplePingDelegate {
 
     public func simplePing(_ pinger: SimplePing, didStartWithAddress address: Data) {
         NSLog(
-            "SwiftSimplePing: Started pinging %@",
+            "SwiftSimplePing: Started pinging host:%@ %@",
+            self.hostName,
             displayAddressForAddress(address: address as NSData))
 
         delegate?.swiftSimplePing(self, didStartWithAddress: address)
@@ -333,7 +483,8 @@ extension SwiftSimplePing: SimplePingDelegate {
 
     public func simplePing(_ pinger: SimplePing, didFailWithError error: Error) {
         NSLog(
-            "SwiftSimplePing: Failed with error: %@",
+            "SwiftSimplePing: host:%@ Failed with error: %@",
+            self.hostName,
             shortErrorFromError(error: error as NSError))
 
         stop()
@@ -342,14 +493,14 @@ extension SwiftSimplePing: SimplePingDelegate {
 
     public func simplePing(_ pinger: SimplePing, didSendPacket packet: Data, sequenceNumber: UInt16)
     {
-        NSLog("SwiftSimplePing: #%u sent", sequenceNumber)
+        NSLog("SwiftSimplePing: host:%@ #%u sent", self.hostName, sequenceNumber)
     }
 
     public func simplePing(
         _ pinger: SimplePing, didFailToSendPacket packet: Data, sequenceNumber: UInt16, error: Error
     ) {
         NSLog(
-            "SwiftSimplePing: #%u send failed: %@", sequenceNumber,
+            "SwiftSimplePing: host:%@ #%u send failed: %@", self.hostName, sequenceNumber,
             shortErrorFromError(error: error as NSError))
 
         handlePingError(sequenceNumber: sequenceNumber, error: error)
@@ -358,12 +509,23 @@ extension SwiftSimplePing: SimplePingDelegate {
     public func simplePing(
         _ pinger: SimplePing, didReceivePingResponsePacket packet: Data, sequenceNumber: UInt16
     ) {
-        NSLog("SwiftSimplePing: #%u received, size=%zu", sequenceNumber, packet.count)
+        NSLog(
+            "SwiftSimplePing:host:%@ #%u received, size=%zu", self.hostName, sequenceNumber,
+            packet.count)
 
         handlePingResponse(sequenceNumber: sequenceNumber, packetSize: packet.count)
     }
 
     public func simplePing(_ pinger: SimplePing, didReceiveUnexpectedPacket packet: Data) {
-        NSLog("SwiftSimplePing: Unexpected packet, size=%zu", packet.count)
+        let desc = parseUnexpectedPacket(packet)
+        NSLog(
+            "SwiftSimplePing: host:%@ Unexpected packet: %@, size=%zu", self.hostName, desc,
+            packet.count)
+        let error = UnexpectedICMPPacketError(description: desc)
+        let result = PingResult(
+            sequenceNumber: 0, latency: nil, error: error, packetSize: packet.count)
+        delegate?.swiftSimplePing(self, didReceivePingResult: result)
+        // stats unchanged, but notify to maintain visibility if needed
+        updateStatistics()
     }
 }
